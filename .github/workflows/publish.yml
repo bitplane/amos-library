@@ -1,0 +1,83 @@
+# Publish the library to amos.bitplane.net/library/ on every push to master.
+#
+# The site has TWO producers and they write to different parts of it:
+# bitplane/amos-ts publishes the player to `/` and `/v/<x.y.z>/` when a `v*`
+# tag lands, and this publishes the disks and their index to `/library/`.
+# Both use `keep_files`, so neither deletes the other's files.
+#
+# Splitting them is the point. Adding a game should not need a release of the
+# emulator, and a patch to the emulator should not re-push megabytes of disk
+# images. The one hazard is the two jobs pushing to the `release` branch at
+# the same second, where the loser's commit is rejected; re-running it is the
+# fix, and it is not worth machinery to prevent something that costs one
+# click.
+#
+# `keep_files` also means a disk DELETED here stays on the site. Removing one
+# for real means deleting it from the release branch by hand.
+name: publish
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+# Two pushes in a minute would otherwise build two sites and race each other
+# onto the branch. The later one wins and the earlier is wasted work.
+concurrency:
+  group: publish
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: library
+
+      # The index is built by amos-ts, not here. It opens every .adf with that
+      # repository's own reader to get the volume label off the root block,
+      # which is the name the disk answers to once it is mounted. A second
+      # implementation of an Amiga filesystem, living in a repository of disk
+      # images, is not a thing anybody should have to maintain.
+      #
+      # Opening each image is also the check that it arrived whole: `isAdf`
+      # accepts three geometries by exact byte count, so a truncated file
+      # fails the index rather than mounting empty on the site.
+      - uses: actions/checkout@v4
+        with:
+          repository: bitplane/amos-ts
+          path: amos-ts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: amos-ts/package-lock.json
+      - run: npm ci
+        working-directory: amos-ts
+
+      # `git archive` rather than `cp -r`, so the repository's whole history
+      # is not published alongside the disks it is the history of.
+      - name: Assemble the library
+        run: |
+          mkdir -p site/library
+          git -C library archive HEAD | tar -x -C site/library
+          cd amos-ts && npx tsx src/cli/genlibrary.ts ../site/library
+      - run: find site -maxdepth 3 | sort
+
+      - name: Publish
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          # the same deploy key amos-ts uses: a write-enabled deploy key on
+          # bitplane/amos.bitplane.net, with its private half in this
+          # repository's secrets as well
+          deploy_key: ${{ secrets.PAGES_DEPLOY_KEY }}
+          external_repository: bitplane/amos.bitplane.net
+          publish_branch: release
+          publish_dir: site
+          keep_files: true
+          cname: amos.bitplane.net
+          commit_message: "library: ${{ github.event.head_commit.message }}"
